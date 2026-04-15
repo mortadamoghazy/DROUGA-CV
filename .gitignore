@@ -1,0 +1,35 @@
+# Mac
+.DS_Store
+
+# Videos
+*.mp4
+*.avi
+*.mov
+
+# Dataset images (large — not tracked)
+dataset/train/
+dataset/val/
+dataset/test/
+
+# Runs / training output (large checkpoints)
+runs/
+
+# Visualisations
+visualisations/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Other scripts not being pushed
+scripts/train.py
+scripts/visualise_predictions.py
+scripts/track_video.py
+scripts/live_detect.py
+
+# PDF
+*.pdf
+
+# Zip
+*.zip
