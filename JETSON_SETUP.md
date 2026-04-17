@@ -456,9 +456,10 @@ The node publishes on these topics:
 | Topic | Type | Content |
 |---|---|---|
 | `/drouga/mannequin_detected` | `std_msgs/Bool` | True when a mannequin is confirmed |
-| `/drouga/mannequin_pixel` | `geometry_msgs/Point` | Pixel centre (cx, cy) |
+| `/drouga/mannequin_pixel` | `geometry_msgs/Point` | Pixel centre (u, v, 0) |
 | `/drouga/mannequin_confidence` | `std_msgs/Float32` | YOLO confidence score |
 | `/drouga/mannequin_track_id` | `std_msgs/Int32` | ByteTrack ID (-1 when none) |
+| `/drouga/mannequin_position_3d` | `geometry_msgs/PointStamped` | 3D position in camera frame (X, Y, Z metres) |
 | `/drouga/annotated_image` | `sensor_msgs/Image` | Debug view with boxes drawn |
 
 ---

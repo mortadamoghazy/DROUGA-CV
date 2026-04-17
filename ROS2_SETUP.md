@@ -10,12 +10,15 @@ This guide covers building and running the `drouga_detection` ROS2 package on th
 ```
 RealSense D435
       ↓  /camera/color/image_raw
+      ↓  /camera/aligned_depth_to_color/image_raw
+      ↓  /camera/color/camera_info
 drouga_detection node
-      ↓  /drouga/mannequin_detected   (Bool)
-      ↓  /drouga/mannequin_pixel      (Point — pixel centre)
-      ↓  /drouga/mannequin_confidence (Float32)
-      ↓  /drouga/mannequin_track_id   (Int32)
-      ↓  /drouga/annotated_image      (Image — debug view)
+      ↓  /drouga/mannequin_detected    (Bool)
+      ↓  /drouga/mannequin_pixel       (Point — pixel centre)
+      ↓  /drouga/mannequin_confidence  (Float32)
+      ↓  /drouga/mannequin_track_id    (Int32)
+      ↓  /drouga/mannequin_position_3d (PointStamped — 3D in camera frame, metres)
+      ↓  /drouga/annotated_image       (Image — debug view)
 Mission state machine / PX4
 ```
 
@@ -112,6 +115,14 @@ Verify it installed:
 ```bash
 ros2 pkg list | grep realsense
 # Expected: realsense2_camera
+```
+
+### 2.3 Install message_filters
+
+`message_filters` is used to time-synchronize the color and aligned-depth image streams.
+
+```bash
+sudo apt install -y ros-humble-message-filters
 ```
 
 ### 2.3 Initialise rosdep
@@ -214,19 +225,29 @@ You need **two terminals** running simultaneously — one for the RealSense came
 
 ### Terminal 1 — Start the RealSense camera node
 
+The detection node needs both the color stream and the aligned depth stream. Enable them with:
+
 ```bash
-ros2 launch realsense2_camera rs_launch.py
+ros2 launch realsense2_camera rs_launch.py \
+  align_depth.enable:=true \
+  depth_module.profile:=640x480x30
 ```
 
-This starts publishing the color stream to `/camera/color/image_raw`. You should see output like:
+`align_depth.enable:=true` tells the RealSense node to publish
+`/camera/aligned_depth_to_color/image_raw` — depth pixels that map 1:1 onto color pixels.
+Without this flag the depth image has a different resolution and field of view.
+
+You should see output like:
 ```
 [realsense2_camera] ... publishing to /camera/color/image_raw
+[realsense2_camera] ... publishing to /camera/aligned_depth_to_color/image_raw
 ```
 
-Verify the topic is live:
+Verify both topics are live:
 ```bash
 ros2 topic hz /camera/color/image_raw
-# Expected: average rate: 30.000
+ros2 topic hz /camera/aligned_depth_to_color/image_raw
+# Both expected: average rate: 30.000
 ```
 
 ### Terminal 2 — Start the detection node
@@ -294,6 +315,26 @@ data: 7     # ByteTrack track ID — stays the same for the same mannequin
             # -1 means no mannequin detected
 ```
 
+### Check the 3D position (camera frame)
+
+```bash
+ros2 topic echo /drouga/mannequin_position_3d
+```
+Output when a mannequin is in view:
+```yaml
+header:
+  frame_id: camera_color_optical_frame
+point:
+  x: 0.15    # metres right of camera centre
+  y: 0.32    # metres below camera centre
+  z: 3.47    # metres forward (depth)
+```
+
+> This topic is only published when:
+> 1. A mannequin is confirmed (GREEN box)
+> 2. Camera intrinsics have been received from `/camera/color/camera_info`
+> 3. The depth value at the detection centre is non-zero (valid measurement)
+
 ### Check publishing rate
 
 ```bash
@@ -339,6 +380,7 @@ ros2 run drouga_detection detection_node --ros-args \
 | `residual_window` | `60` | Frames of motion history to keep (2 seconds) |
 | `residual_threshold` | `8.0` | Max pixel residual to classify as stationary |
 | `publish_annotated` | `true` | Whether to publish the annotated debug image |
+| `depth_window` | `10` | Side length (px) of the depth sampling window at the detection centre |
 
 ### Change a parameter while the node is already running
 
@@ -362,16 +404,19 @@ from launch_ros.actions import Node
 def generate_launch_description():
     return LaunchDescription([
 
-        # RealSense camera node
+        # RealSense camera node — color + aligned depth
         Node(
             package='realsense2_camera',
             executable='realsense2_camera_node',
             name='realsense',
             parameters=[{
-                'color_width':  640,
-                'color_height': 480,
-                'color_fps':    30.0,
-                'enable_depth': False,   # set True when depth fusion is added
+                'color_width':         640,
+                'color_height':        480,
+                'color_fps':           30.0,
+                'depth_width':         640,
+                'depth_height':        480,
+                'depth_fps':           30.0,
+                'align_depth.enable':  True,   # publishes /camera/aligned_depth_to_color/image_raw
             }]
         ),
 
@@ -413,8 +458,8 @@ source ~/ros2_ws/install/setup.bash
 
 # ── Every session ────────────────────────────────────────────────────────────
 
-# Terminal 1 — camera
-ros2 launch realsense2_camera rs_launch.py
+# Terminal 1 — camera (color + aligned depth)
+ros2 launch realsense2_camera rs_launch.py align_depth.enable:=true depth_module.profile:=640x480x30
 
 # Terminal 2 — detection node
 ros2 run drouga_detection detection_node
@@ -422,6 +467,7 @@ ros2 run drouga_detection detection_node
 # Terminal 3 — monitor
 ros2 topic echo /drouga/mannequin_detected
 ros2 topic echo /drouga/mannequin_pixel
+ros2 topic echo /drouga/mannequin_position_3d
 ros2 topic hz   /drouga/mannequin_detected
 
 # ── Or launch everything at once ─────────────────────────────────────────────
