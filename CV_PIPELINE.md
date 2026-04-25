@@ -21,6 +21,8 @@ Orin Nano during the ERL 2026 competition.
 12. [Published Topics](#12-published-topics)
 13. [Subscribed Topics](#13-subscribed-topics)
 14. [Known Limitations and Risks](#14-known-limitations-and-risks)
+15. [Planned: Metric 3 — Pose-Based Joint Stability](#15-planned-metric-3--pose-based-joint-stability)
+16. [Compute Budget](#16-compute-budget)
 
 ---
 
@@ -356,9 +358,12 @@ When suspended, the gate falls through to Metric 2 only.
 
 ---
 
-## 7. Stage 4 — Metric 2: Intra-Bbox Optical Flow
+## 7. Stage 4 — Metric 2: Body-Motion Check (flow or pose)
 
-### What it measures
+Metric 2 detects body motion that Metric 1 misses — gestures, breathing, weight shifts.
+Two implementations are available, selected at launch via `classifier_mode`.
+
+### Option A — Intra-Bbox Optical Flow (`classifier_mode=flow`)
 
 How much the object's body moves independently of the camera between two consecutive
 frames, measured inside the bounding box in the raw frame.
@@ -454,26 +459,77 @@ Crops smaller than 20×20 pixels are not processed (returns 999.0 — metric is 
 For a ~1.7m mannequin at 3m depth the RealSense D435i produces a bounding box of roughly
 200×100 pixels, so this limit is only reached for very distant targets (>8m).
 
+### Option B — Pose-Based Joint Stability (`classifier_mode=pose`)
+
+Run YOLOv8-pose on the bounding box crop to estimate 17 COCO keypoints. Track the
+**shape** of the skeleton across a rolling window. A mannequin's skeleton shape never
+changes. A human's does — even for subtle breathing (shoulders rise 5–10px per cycle).
+
+**Camera motion invariance**: joint positions are expressed relative to the bbox centre
+and normalised by the bbox diagonal. Camera movement shifts all joints equally, so it
+cancels out in the relative representation. No ego-compensation warp is needed.
+
+**Stability score**: 75th percentile of the per-coordinate standard deviation across
+the window. The most-moving joint dominates — one waving hand raises the score even if
+the torso is completely still.
+
+```
+sigma    = percentile_75( nanstd( pose_history[tid], axis=0 ) )
+pose_ok  = sigma < joint_stability_threshold (default 0.008)
+```
+
+At a typical 450px bbox diagonal, `0.008` corresponds to ~3.6px of joint movement.
+
+### Option C — Both simultaneously (`classifier_mode=both`)
+
+Runs both flow and pose every frame. Both must pass for `is_mannequin` to be True.
+The annotated label shows both values: `flow=0.8px σ=0.0042`.
+Use this mode to compare the two metrics side-by-side and decide which to keep.
+
+### Selecting a mode
+
+Use `run_detection.sh` — it asks you at launch:
+```
+  1) flow  — Farneback optical flow only
+  2) pose  — YOLOv8-pose joint stability only
+  3) both  — run both, show both scores, both must pass
+```
+
+Or pass directly:
+```bash
+ros2 run drouga_detection detection_node --ros-args -p classifier_mode:=pose
+```
+
 ---
 
 ## 8. Stage 5 — Classification Gate
 
-A track is labelled `mannequin` only when ALL three conditions are met simultaneously:
+A track is labelled `mannequin` only when ALL conditions are met simultaneously:
 
 ```python
-confirmed     = consecutive_hits[tid] >= confirm_frames          # seen long enough
-centroid_ok   = centroid_std < world_stability_threshold          # not moving in world
-flow_ok       = flow_p75 < bbox_flow_threshold                    # not gesturing
+confirmed     = consecutive_hits[tid] >= confirm_frames   # seen long enough
+centroid_ok   = centroid_std < world_stability_threshold  # not moving in world (Metric 1)
+flow_ok_final = <result of Metric 2, depends on mode>     # not gesturing (Metric 2)
 
-is_mannequin  = confirmed AND centroid_ok AND flow_ok
+is_mannequin  = confirmed AND centroid_ok AND flow_ok_final
 ```
 
-| State | Box colour | Label |
-|-------|-----------|-------|
-| Not yet confirmed (< 25 frames) | Grey | `#ID  N/confirm_frames` |
-| Confirmed, both metrics LOW | Green | `MANNEQUIN Δ=X.Xcm flow=X.Xpx  D.DXm` |
-| Confirmed, centroid HIGH | Orange | `HUMAN(moving) Δ=X.Xcm flow=X.Xpx` |
-| Confirmed, flow HIGH | Orange | `HUMAN(gesture) Δ=X.Xcm flow=X.Xpx` |
+`flow_ok_final` resolves based on `classifier_mode`:
+
+| Mode | `flow_ok_final` |
+|------|----------------|
+| `flow` | `flow_p75 < bbox_flow_threshold` |
+| `pose` | `sigma < joint_stability_threshold` |
+| `both` | `flow_p75 < bbox_flow_threshold AND sigma < joint_stability_threshold` |
+
+| State | Box colour | Label (flow mode) | Label (pose mode) |
+|-------|-----------|-------------------|-------------------|
+| Not yet confirmed | Grey | `#ID  N/25` | `#ID  N/25` |
+| Confirmed, mannequin | Green | `MANNEQUIN Δ=2.1cm flow=0.8px 3.47m` | `MANNEQUIN Δ=2.1cm σ=0.0042 3.47m` |
+| Confirmed, centroid HIGH | Orange | `HUMAN(moving) Δ=12cm flow=0.8px` | `HUMAN(moving) Δ=12cm σ=0.0042` |
+| Confirmed, Metric 2 HIGH | Orange | `HUMAN(gesture) Δ=1.2cm flow=3.1px` | `HUMAN(gesture) Δ=1.2cm σ=0.031` |
+
+In `both` mode the label shows: `MANNEQUIN Δ=2.1cm flow=0.8px σ=0.0042 3.47m`
 
 Once a track is labelled mannequin, it stays that way until either metric exceeds its
 threshold. This hysteresis prevents flickering if the drone briefly vibrates more.
@@ -526,19 +582,41 @@ installed, and we do not want the code to behave differently there.
 
 ## 10. All Parameters — Reference Table
 
+**Detection and tracking**
+
 | Parameter | Type | Default | Unit | What to change it for |
 |-----------|------|---------|------|----------------------|
-| `model_path` | string | `/home/user/drouga/best.engine` | — | Set to your actual path on the Jetson |
-| `conf` | float | 0.35 | — | Raise if too many false positives; lower if mannequin is missed |
-| `mannequin_class` | int | 0 | — | Do not change (model has one class) |
-| `publish_annotated` | bool | true | — | Set false to save bandwidth (saves ~5 ms/frame) |
-| `confirm_frames` | int | 25 | frames | Raise to reduce false alarms; lower if detection is too slow to trigger |
+| `model_path` | string | `/home/user/drouga/best.engine` | — | Set to your actual Jetson path before first run |
+| `conf` | float | 0.35 | — | Raise if false positives; lower if mannequin is missed |
+| `mannequin_class` | int | 0 | — | Do not change (single-class model) |
+| `publish_annotated` | bool | true | — | Set false during competition to save ~5ms/frame |
+| `confirm_frames` | int | 25 | frames | Raise to reduce false alarms; lower if reaction is too slow |
+
+**EIS (Stage 1)**
+
+| Parameter | Type | Default | Unit | What to change it for |
+|-----------|------|---------|------|----------------------|
 | `eis_alpha` | float | 0.08 | — | Lower for more smoothing (heavy vibration); raise if EIS fights navigation |
-| `eis_aggressive_threshold` | float | 5.0 | degrees | How fast a rotation must be before alpha is raised to 0.6 |
-| `world_stability_window` | int | 30 | frames | ~1 s history; raise for slower drones, lower for faster |
-| `world_stability_threshold` | float | 0.08 | metres | Raise if mannequin fails metric (e.g. big wind gusts); lower to be stricter |
-| `bbox_flow_threshold` | float | 1.5 | pixels | Lower to catch subtler gestures; raise if windy textures cause false rejects |
-| `depth_window` | int | 10 | pixels | Raise on surfaces with many depth holes; lower for small/far targets |
+| `eis_aggressive_threshold` | float | 5.0 | degrees | Angle above which alpha jumps to 0.6 to follow intentional turns |
+
+**Metric 1 — world centroid (Stage 3)**
+
+| Parameter | Type | Default | Unit | What to change it for |
+|-----------|------|---------|------|----------------------|
+| `world_stability_window` | int | 30 | frames | ~1s history; raise to catch slower walkers |
+| `world_stability_threshold` | float | 0.08 | metres | Raise in strong wind; lower to be stricter |
+| `depth_window` | int | 10 | pixels | Raise on surfaces with many depth holes |
+
+**Metric 2 — body motion (Stage 4)**
+
+| Parameter | Type | Default | Unit | What to change it for |
+|-----------|------|---------|------|----------------------|
+| `classifier_mode` | string | `flow` | — | `flow`, `pose`, or `both` — select via `run_detection.sh` |
+| `bbox_flow_threshold` | float | 1.5 | pixels | (flow/both) Lower to catch subtler gestures; raise if false rejects |
+| `pose_model_path` | string | `yolov8n-pose.engine` | — | (pose/both) Path to pose TensorRT engine on Jetson |
+| `joint_stability_threshold` | float | 0.008 | normalised | (pose/both) Lower = stricter. At 450px bbox diagonal, 0.008 ≈ 3.6px |
+| `joint_stability_window` | int | 40 | frames | (pose/both) ~1.3s history; raise to catch slow movements like breathing |
+| `joint_kp_conf` | float | 0.30 | — | (pose/both) Min keypoint confidence to include; raise if pose is noisy |
 
 ### Overriding at launch
 
@@ -609,7 +687,27 @@ Have a person walk between the drone and the mannequin. Verify:
 - Mannequin → green box throughout.
 
 If walking person turns green: `world_stability_threshold` too loose — lower it.
-If person waving turns green: `bbox_flow_threshold` too loose — lower it.
+If person waving turns green: `bbox_flow_threshold` (flow mode) or `joint_stability_threshold`
+(pose mode) too loose — lower it.
+
+### Step 6 — Choosing between flow and pose mode
+
+Run in `both` mode during early testing so you can see both scores on every box:
+
+```bash
+bash run_detection.sh   # choose 3
+```
+
+Look at the label values for the mannequin and for a human standing nearby:
+
+- If `flow=` separates them cleanly → use `flow` mode.
+- If `σ=` separates them more clearly → use `pose` mode.
+- If neither alone is clean → keep `both`.
+
+Typical observations:
+- In calm indoor conditions, `pose` is more stable (no texture/illumination sensitivity).
+- Outdoors with wind, `flow` may produce false high values on the mannequin's clothing.
+  Switch to `pose` if this happens.
 
 ---
 
@@ -670,3 +768,116 @@ to receive data.
 | D435i depth range: 0.3m – 3m reliable, up to 10m degraded | Medium | At >3m, depth holes increase; `depth_window` should be larger (`-p depth_window:=20`) |
 | EIS does not correct translational shake | Low | Translational jitter is smaller than rotational in a typical drone; not worth the complexity of translation correction |
 | ByteTrack ID switch if mannequin is occluded for >1s | Low | IoU gate and Kalman predict-only keep IDs for ~30 frames after occlusion; unlikely at >1m altitude |
+
+---
+
+## 15. Pose-Based Joint Stability — Implementation Details
+
+> **Status**: fully integrated into `detection_node.py` as `classifier_mode=pose` (or `both`).
+> Prototype script `scripts/live_detect_pose.py` available for laptop-only threshold tuning
+> before deploying on the Jetson.
+
+### Concept
+
+Run a COCO-trained YOLOv8-pose model on each detected bounding box to estimate 17 body
+keypoints (shoulders, elbows, wrists, hips, knees, ankles, etc.). Track the **shape** of
+the skeleton — expressed as normalised joint positions relative to the bounding box centre —
+over a rolling window. A mannequin's skeleton shape does not change between frames. A
+human's does, even when they appear to be standing still (breathing, micro-movements,
+weight shifts).
+
+This metric is **camera-motion-invariant by design**: because we measure relative positions
+between joints (not absolute pixel positions), any camera movement that shifts all joints
+equally cancels out automatically. No ego-motion compensation is needed for this metric.
+
+### What it catches that the other two metrics miss
+
+| Scenario | Metric 1 | Metric 2 | Metric 3 |
+|----------|----------|----------|----------|
+| Walking human | ✓ catches | ✓ catches | ✓ catches |
+| Gesturing / waving human | ✗ misses (world pos stable) | ✓ catches | ✓ catches |
+| Human standing perfectly still, breath only | ✗ misses | ✗ misses (breathing flow below threshold) | ✓ catches (shoulder rise ~5–10px) |
+| Mannequin | ✓ passes | ✓ passes | ✓ passes |
+
+### Threshold tuning on the laptop (do before Jetson deployment)
+
+Run the standalone prototype — no ROS2 required:
+```bash
+python scripts/live_detect_pose.py
+```
+Stand completely still and note your `σ=` value (breathing alone gives σ ≈ 0.012–0.025).
+Wave a hand and note σ (typically > 0.05). Set `joint_stability_threshold` to roughly
+half your still-breathing value. The default of `0.008` is conservative — lower it if
+a still human is still turning green.
+
+### How the pose metric is selected at runtime
+
+Use `run_detection.sh` and choose option 2 or 3, or pass directly:
+```bash
+ros2 run drouga_detection detection_node --ros-args \
+  -p classifier_mode:=pose \
+  -p pose_model_path:=/home/mortada/drouga/yolov8n-pose.engine \
+  -p joint_stability_threshold:=0.008 \
+  -p joint_stability_window:=40
+```
+
+### No custom training needed
+
+The COCO-trained YOLOv8n-pose model is used **only on crops that your custom model
+already detected** as mannequin candidates. Your custom model (mAP50=0.958) handles the
+detection; the pose model handles the joint measurement. No re-training, no keypoint
+annotations on your dataset.
+
+---
+
+## 16. Compute Budget
+
+How heavy is the pipeline? Below are realistic estimates for the Jetson Orin Nano with
+the TensorRT FP16 engine.
+
+### Per-frame cost (single detection in frame, ~30 Hz target)
+
+| Stage | Where it runs | Estimated cost | Notes |
+|-------|--------------|----------------|-------|
+| EIS warp (`warpPerspective`) | GPU | ~1 ms | GPU-accelerated in OpenCV |
+| YOLO TensorRT FP16 inference | GPU | ~20–25 ms | Dominant cost. This is the budget. |
+| Coordinate remapping (`perspectiveTransform`) | CPU | < 0.1 ms | Negligible |
+| Metric 1: depth sample + 3D math | CPU | < 0.5 ms | Just array indexing + matrix multiply |
+| Metric 2: Farneback dense flow (per bbox) | CPU | ~3–6 ms | Runs on CPU — main variable cost |
+| Annotated image publish (if enabled) | CPU + GPU | ~3–5 ms | Disable with `publish_annotated:=false` |
+| **Total (current, 1 detection)** | | **~28–36 ms** | **~28–35 FPS** |
+
+### Cost by classifier_mode (per frame, 1 detection)
+
+| Mode | Additional cost | Total estimate | FPS estimate |
+|------|----------------|----------------|-------------|
+| `flow` | +3–6 ms (CPU Farneback) | ~28–36 ms | ~28–35 FPS |
+| `pose` | +3–5 ms (GPU pose model) | ~28–35 ms | ~28–35 FPS |
+| `both` | +6–11 ms (CPU + GPU) | ~31–41 ms | ~24–32 FPS |
+
+`pose` is roughly the same cost as `flow` because it runs on the GPU. `both` runs both
+and is the most expensive — only use it for comparison testing, not competition.
+
+### Is it okay?
+
+**Yes, with conditions.**
+
+The `~28 FPS` figure with TensorRT already accounts for the biggest cost — the YOLO
+inference. The rest of the pipeline adds at most ~10ms total. On the Jetson Orin Nano:
+
+- The GPU handles EIS and YOLO in parallel with the CPU handling metrics.
+- Two detections in frame at once roughly doubles Metric 2 cost (Farneback runs once
+  per bbox, on CPU).
+- TensorRT engine (`best.engine`) is mandatory for real-time operation. The PyTorch
+  fallback (`best.pt`) runs at ~8 FPS — not usable.
+
+**The two things that hurt most:**
+
+1. `publish_annotated:=true` — encoding and publishing a 640×480 BGR image at 30Hz adds
+   ~3–5ms. Disable it when not debugging.
+2. Metric 2 (Farneback) on large bounding boxes — a full-frame bbox (person very close
+   to the camera) can take ~8ms. This is rare in practice since the drone maintains >1m
+   distance.
+
+**Metric 3 (pose) is cheaper than Metric 2** because YOLOv8n-pose runs on the GPU,
+not the CPU, and operates only on the small crop — not the full frame.

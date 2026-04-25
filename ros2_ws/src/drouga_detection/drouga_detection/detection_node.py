@@ -148,6 +148,61 @@ class DetectionNode(Node):
         # sampling at the detection centre.  Larger → more robust to depth holes
         # but less precise for small objects.
 
+        # ── Metric 2 mode selection ───────────────────────────────────────────
+        self.declare_parameter('classifier_mode', 'flow')
+        # classifier_mode: which method to use for Metric 2 (body-motion check).
+        #
+        #   'flow'  — Farneback dense optical flow inside the bounding box after
+        #             ego-motion compensation.  Does NOT require a second model.
+        #             Tuning knob: bbox_flow_threshold (pixels).
+        #             Cost: ~3–6 ms per detection box (CPU).
+        #
+        #   'pose'  — YOLOv8-pose joint stability.  Loads a second model.
+        #             Measures how much the skeleton SHAPE changes across frames.
+        #             No ego-motion compensation needed — relative joint distances
+        #             are camera-motion invariant.
+        #             Tuning knob: joint_stability_threshold (normalised units).
+        #             Cost: ~3–5 ms per detection box (GPU, TensorRT).
+        #
+        #   'both'  — Runs BOTH metrics every frame.  A track is classified as
+        #             mannequin only if BOTH metrics pass simultaneously.
+        #             Use this mode to compare the two metrics side-by-side on
+        #             the annotated image and decide which to keep.
+        #             Label shows: flow=X.Xpx σ=X.XXXX
+        #             Loads the pose model.  Highest CPU+GPU cost of the three.
+        #
+        # Switch at launch with:  --ros-args -p classifier_mode:=pose
+
+        # Parameters used only when classifier_mode = 'pose'
+        self.declare_parameter('pose_model_path', 'yolov8n-pose.engine')
+        # pose_model_path: path to the YOLOv8-pose TensorRT engine.
+        # Falls back to yolov8n-pose.pt in the same directory if not found.
+        # Export on the Jetson with:
+        #   python3 -c "from ultralytics import YOLO; \
+        #     YOLO('yolov8n-pose.pt').export(format='engine', half=True, imgsz=640, device=0)"
+
+        self.declare_parameter('joint_stability_threshold', 0.008)
+        # joint_stability_threshold (normalised, unitless):
+        # The 75th-percentile standard deviation of normalised joint coordinates
+        # across the window.  Coordinates are normalised by bbox diagonal, so this
+        # is scale-invariant.  At a 450px diagonal (typical 1.7m person at 2.5m):
+        #   0.008 ≈ 3.6 px of joint movement allowed
+        #   0.005 ≈ 2.3 px  (stricter — catches subtle breathing)
+        #   0.015 ≈ 6.8 px  (looser — only catches clear gestures)
+        # Start at 0.008 and lower until a truly still person turns orange.
+
+        self.declare_parameter('joint_stability_window', 40)
+        # joint_stability_window (frames):
+        # How many frames of pose history to keep per track (~1.3s at 30fps).
+        # Longer window catches slow drifts (weight shifts, slow head turns).
+        # Raise to 60 if slow human movements still slip through.
+
+        self.declare_parameter('joint_kp_conf', 0.30)
+        # joint_kp_conf: minimum per-keypoint confidence to include a joint in
+        # the stability measurement.  0.30 includes moderately uncertain joints
+        # so more of the body contributes.  Raise to 0.50 to use only highly
+        # confident joints (more stable but fewer joints → less sensitive).
+
         # Read all parameter values into instance variables now.
         # (Subsequent runtime changes via ros2 param set are NOT auto-applied to
         #  these variables — the node would need to be restarted or a param
@@ -163,6 +218,10 @@ class DetectionNode(Node):
         self.world_thresh     = self.get_parameter('world_stability_threshold').value
         self.flow_thresh      = self.get_parameter('bbox_flow_threshold').value
         self.depth_window     = self.get_parameter('depth_window').value
+        self.classifier_mode  = self.get_parameter('classifier_mode').value
+        self.joint_thresh     = self.get_parameter('joint_stability_threshold').value
+        self.joint_win        = self.get_parameter('joint_stability_window').value
+        self.joint_kp_conf    = self.get_parameter('joint_kp_conf').value
 
         # ── Model loading ─────────────────────────────────────────────────────
         # Fall back to best.pt if the TensorRT engine has not been exported yet.
@@ -172,6 +231,33 @@ class DetectionNode(Node):
             model_path = fallback
         self.model = YOLO(model_path)
         self.get_logger().info(f'Model loaded: {model_path}')
+
+        # ── Pose model (only loaded when classifier_mode = 'pose') ────────────
+        self.pose_model = None
+        if self.classifier_mode in ('pose', 'both'):
+            pose_path = self.get_parameter('pose_model_path').value
+            if not Path(pose_path).exists():
+                # Try .pt fallback in the same directory as the engine path,
+                # and also try the current working directory.
+                fallback_same_dir = str(Path(pose_path).parent / 'yolov8n-pose.pt')
+                fallback_cwd      = 'yolov8n-pose.pt'
+                if Path(fallback_same_dir).exists():
+                    pose_path = fallback_same_dir
+                else:
+                    pose_path = fallback_cwd   # Ultralytics will auto-download this
+                self.get_logger().warn(
+                    f'Pose engine not found — falling back to {pose_path}. '
+                    'Export the engine on the Jetson for full speed.'
+                )
+            self.pose_model = YOLO(pose_path)
+            self.get_logger().info(
+                f'Pose model loaded: {pose_path}  '
+                f'(classifier_mode=pose, threshold={self.joint_thresh})'
+            )
+        else:
+            self.get_logger().info(
+                f'classifier_mode=flow  (bbox_flow_threshold={self.flow_thresh})'
+            )
 
         # ── ByteTrack / classification state ──────────────────────────────────
         # consecutive_hits[tid]: how many frames in a row this track has been
@@ -188,9 +274,15 @@ class DetectionNode(Node):
         )
 
         # bbox_flow_history[tid]: rolling window of mean intra-bbox flow
-        # magnitudes (pixels) for Metric 2.
+        # magnitudes (pixels) for Metric 2 when classifier_mode='flow'.
         self.bbox_flow_history: dict[int, deque] = defaultdict(
             lambda: deque(maxlen=self.world_win)
+        )
+
+        # joint_pose_history[tid]: rolling window of normalised pose vectors
+        # (shape 34 = 17 keypoints × 2 coords) for Metric 2 when mode='pose'.
+        self.joint_pose_history: dict[int, deque] = defaultdict(
+            lambda: deque(maxlen=self.joint_win)
         )
 
         # ── EIS state ─────────────────────────────────────────────────────────
@@ -718,6 +810,74 @@ class DetectionNode(Node):
         return float(np.mean(magnitude))
 
     # ──────────────────────────────────────────────────────────────────────────
+    # Stage 3 — Metric 2 alternative: pose-based joint stability
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _pose_metric(self, raw_frame: np.ndarray, tid: int,
+                     x1: int, y1: int, x2: int, y2: int):
+        """
+        Run YOLOv8-pose on the detection crop and measure how much the skeleton
+        shape changes across a rolling window.
+
+        Returns (sigma, is_stable):
+          sigma     — the 75th-percentile std of normalised joint coordinates.
+                      Lower = more rigid. Use this value to tune the threshold.
+          is_stable — True if sigma < joint_stability_threshold.
+
+        Returns (999.0, False) when:
+          - Crop is too small (< 20×20 px).
+          - Pose model finds no person in the crop.
+          - Fewer than 5 frames of history exist yet.
+
+        Normalisation:
+          Joint (x, y) coordinates are shifted by the crop centre and divided
+          by the crop diagonal.  This makes the vector invariant to the person's
+          position and size in the frame — only the SHAPE of the skeleton matters.
+          Camera motion shifts all joints equally → cancels out in the relative
+          representation.  No ego-compensation warp is needed here.
+        """
+        if (x2 - x1) < 20 or (y2 - y1) < 20:
+            return 999.0, False
+
+        crop = raw_frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return 999.0, False
+
+        pose_result = self.pose_model(crop, verbose=False)[0]
+        if pose_result.keypoints is None or len(pose_result.keypoints) == 0:
+            return 999.0, False
+
+        kp_xy   = pose_result.keypoints[0].xy[0].cpu().numpy()    # (17, 2)
+        kp_conf = pose_result.keypoints[0].conf[0].cpu().numpy()   # (17,)
+
+        # Normalise: origin = crop centre, scale = crop diagonal
+        cx_crop = (x2 - x1) / 2.0
+        cy_crop = (y2 - y1) / 2.0
+        diag    = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2) + 1e-6
+
+        vec = np.full(34, np.nan, dtype=np.float32)
+        for i, (kp, kc) in enumerate(zip(kp_xy, kp_conf)):
+            if kc >= self.joint_kp_conf:
+                vec[i * 2]     = (kp[0] - cx_crop) / diag
+                vec[i * 2 + 1] = (kp[1] - cy_crop) / diag
+
+        self.joint_pose_history[tid].append(vec)
+
+        if len(self.joint_pose_history[tid]) < 5:
+            return 999.0, False
+
+        mat   = np.array(self.joint_pose_history[tid], dtype=np.float32)  # (T, 34)
+        stds  = np.nanstd(mat, axis=0)      # std per coordinate across T frames
+        valid = stds[~np.isnan(stds)]       # drop coordinates never visible
+        if valid.size == 0:
+            return 999.0, False
+
+        # 75th percentile: the most-moving joints dominate the score.
+        # One waving hand raises sigma even if the torso is perfectly still.
+        sigma = float(np.percentile(valid, 75))
+        return sigma, sigma < self.joint_thresh
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Main callback — runs once per synchronised color + depth pair (~30 Hz)
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -836,32 +996,61 @@ class DetectionNode(Node):
                     depth_m = self._sample_depth(depth_image, cx_r, cy_r)
                     P_world = None
 
-                # ── STAGE 3 — Metric 2: intra-bbox optical flow ───────────────
-                flow_mag = self._intra_bbox_flow(
-                    raw_frame, T_rel, x1_r, y1_r, x2_r, y2_r
-                )
-                self.bbox_flow_history[tid].append(flow_mag)
-                flow_p75 = float(
-                    np.percentile(list(self.bbox_flow_history[tid]), 75)
-                ) if self.bbox_flow_history[tid] else 999.0
-                flow_ok = flow_p75 < self.flow_thresh
+                # ── STAGE 3 — Metric 2 (mode-dependent) ──────────────────────
+                # 'flow': Farneback optical flow (CPU). Tune: bbox_flow_threshold
+                # 'pose': YOLOv8-pose joint stability (GPU). Tune: joint_stability_threshold
+                # 'both': runs both every frame; both must pass; label shows both values.
+
+                # --- flow branch (used by 'flow' and 'both') ------------------
+                flow_p75 = 999.0
+                flow_ok  = False
+                if self.classifier_mode in ('flow', 'both'):
+                    flow_mag = self._intra_bbox_flow(
+                        raw_frame, T_rel, x1_r, y1_r, x2_r, y2_r
+                    )
+                    self.bbox_flow_history[tid].append(flow_mag)
+                    flow_p75 = float(
+                        np.percentile(list(self.bbox_flow_history[tid]), 75)
+                    ) if self.bbox_flow_history[tid] else 999.0
+                    flow_ok = flow_p75 < self.flow_thresh
+
+                # --- pose branch (used by 'pose' and 'both') ------------------
+                sigma    = 999.0
+                pose_ok  = False
+                if self.classifier_mode in ('pose', 'both'):
+                    sigma, pose_ok = self._pose_metric(
+                        raw_frame, tid, x1_r, y1_r, x2_r, y2_r
+                    )
+
+                # --- combine results and build annotation label ---------------
+                if self.classifier_mode == 'flow':
+                    flow_ok_final = flow_ok
+                    m2_label = f'flow={flow_p75:.1f}px'
+                elif self.classifier_mode == 'pose':
+                    flow_ok_final = pose_ok
+                    m2_label = f'σ={sigma:.4f}'
+                else:  # 'both' — both must pass; label shows both values
+                    flow_ok_final = flow_ok and pose_ok
+                    m2_label = f'flow={flow_p75:.1f}px σ={sigma:.4f}'
 
                 # ── STAGE 5 — Classification gate ─────────────────────────────
                 confirmed = self.consecutive_hits[tid] >= self.confirm_frames
 
-                # Require at least half the window filled before trusting metrics.
-                # This prevents false mannequin labels in the first few frames.
-                has_history = len(self.bbox_flow_history[tid]) >= 5
+                # Require minimum history in whichever deque(s) are active.
+                flow_ready = (len(self.bbox_flow_history[tid]) >= 5
+                              if self.classifier_mode in ('flow', 'both') else True)
+                pose_ready = (len(self.joint_pose_history[tid]) >= 5
+                              if self.classifier_mode in ('pose', 'both') else True)
+                has_history = flow_ready and pose_ready
 
                 if T_world_cam is not None:
                     # Normal mode: both metrics must agree.
-                    world_ready  = len(self.world_pos_history[tid]) >= self.world_win // 2
+                    world_ready   = len(self.world_pos_history[tid]) >= self.world_win // 2
                     is_stationary = (has_history and world_ready
-                                     and centroid_ok and flow_ok)
+                                     and centroid_ok and flow_ok_final)
                 else:
-                    # VSLAM fallback: only flow metric available.
-                    # Less reliable but keeps the pipeline running.
-                    is_stationary = has_history and flow_ok
+                    # VSLAM fallback: only Metric 2 available.
+                    is_stationary = has_history and flow_ok_final
 
                 if confirmed and is_stationary:
                     self.mannequin_tracks.add(tid)
@@ -882,7 +1071,7 @@ class DetectionNode(Node):
                         thickness = 3
                         status = (f'MANNEQUIN '
                                   f'Δ={centroid_std*100:.1f}cm '
-                                  f'flow={flow_p75:.1f}px '
+                                  f'{m2_label} '
                                   f'{depth_m:.2f}m')
                     elif confirmed:
                         colour    = (0, 140, 255)  # orange
@@ -890,7 +1079,7 @@ class DetectionNode(Node):
                         reason    = 'moving' if not centroid_ok else 'gesture'
                         status = (f'HUMAN({reason}) '
                                   f'Δ={centroid_std*100:.1f}cm '
-                                  f'flow={flow_p75:.1f}px')
+                                  f'{m2_label}')
                     else:
                         colour    = (160, 160, 160)  # grey
                         thickness = 1
@@ -945,9 +1134,9 @@ class DetectionNode(Node):
 
         # ── Publish annotated image ───────────────────────────────────────────
         if self.pub_annotated and annotation_frame is not None:
-            n_mann = len([t for t in active_tids if t in self.mannequin_tracks])
-            mode   = 'VSLAM' if T_world_cam is not None else 'IMU-fallback'
-            hud = (f'DROUGA | {mode} | '
+            n_mann    = len([t for t in active_tids if t in self.mannequin_tracks])
+            slam_mode = 'VSLAM' if T_world_cam is not None else 'IMU-fallback'
+            hud = (f'DROUGA | {slam_mode} | M2={self.classifier_mode} | '
                    f'Active: {len(active_tids)} | Mannequin: {n_mann} | '
                    f'conf={self.conf}')
             cv2.putText(annotation_frame, hud, (8, 24),
