@@ -16,37 +16,60 @@ Autonomous drone must:
 
 ## Hardware
 - Drone: max 1m diagonal, max 4kg total weight including payload
-- Companion computer: Jetson Orin Nano
-- Depth camera: Intel RealSense D435 (stereo depth, NO IMU — confirmed 2026-04-15)
-- IMU: separate external IMU may be available later — not confirmed yet
+- Companion computer: Jetson Orin Nano ✓ in hand
+- Depth camera: Intel RealSense D435**i** (stereo depth + built-in IMU gyro/accel) ✓ in hand
 - Flight controller: Pixhawk 6C running PX4
-- Communication: MAVLink/MAVROS over USB
-- NOTE: RealSense and Jetson not yet in hand as of 2026-04-09
+- Communication: MAVLink / uXRCE-DDS bridge
+- Remote monitoring: Ubuntu 24.04 laptop (ROS2 Jazzy), connected via ROS_DOMAIN_ID=42
 
 ## Software Stack
-- ROS2 Humble (middleware)
-- VINS-Fusion or OpenVINS (Visual-Inertial Odometry — localization without GPS)
+- ROS2 Humble (middleware, on Jetson)
+- **Isaac ROS Visual SLAM** (6-DOF camera pose at ~30Hz — confirmed running on Jetson)
 - Voxblox (3D ESDF mapping from depth data)
 - EGO-Planner (local trajectory planning, obstacle avoidance)
 - RRT* (global path planner)
 - **YOLOv8m** (mannequin detection — single class) ✓ DONE
 - **ByteTrack** (target tracking) ✓ DONE
-- **Ego-motion compensation** (optical flow homography to separate mannequins from humans) ✓ DONE
-- Visual servoing (precision landing approach)
-- ArUco marker at base (precision return landing)
+- **EIS** (Electronic Image Stabilisation — pre-YOLO vibration removal via VSLAM) ✓ DONE
+- **World-frame centroid stability** (Metric 1 — catches walking humans) ✓ DONE
+- **Intra-bbox optical flow / pose joint stability** (Metric 2 — catches gesturing humans, selectable) ✓ DONE
+- Visual servoing (precision landing approach) ⬜ TODO
+- ArUco marker at base (precision return landing) ⬜ TODO
 
-## Detection Pipeline
-- **Single class: `mannequin` (class 0) only**
-- Bystander/human detection dropped — humans handled as obstacles by Voxblox depth data
-- Reason for single class: two-class model had classification loss 3.1 at epoch 40 (mannequin and human look too similar)
-- Model: YOLOv8m fine-tuned, exported to TensorRT FP16 on Jetson (~28 FPS)
-- Confirmation gate: track must appear in 25 consecutive frames (~0.8s) before committing
-- Ego-motion compensation: frame-to-frame homography via Lucas-Kanade optical flow
-  - Residual = how far a track moves BEYOND camera motion
-  - Low 75th-pct residual over 60-frame window → stationary in world → mannequin
-  - High residual → moving independently → human/bystander
-- Tracking: ByteTrack (IoU + Kalman filter, tightly integrated with YOLO via Ultralytics)
-- ROS2 node publishes results to `/drouga/mannequin_detected`, `/drouga/mannequin_pixel`, etc.
+## Detection Pipeline (current — fully implemented)
+
+### Overview
+The node runs on the Jetson at ~30Hz. Per frame:
+
+1. **EIS** — warp raw frame using VSLAM orientation (adaptive EMA filter) to remove drone vibration before YOLO sees it
+2. **YOLO + ByteTrack** — detect mannequins on stabilised frame, assign persistent track IDs
+3. **Coordinate remap** — map detections back to raw frame coordinates (H_stab_inv) for depth/3D
+4. **Metric 1** — back-project detection + depth to world frame via VSLAM pose; track world position variance over 30 frames; low σ → stationary → mannequin candidate
+5. **Metric 2** (selectable via `classifier_mode`):
+   - `flow`: Farneback dense optical flow inside bbox after ego-compensation warp
+   - `pose`: YOLOv8-pose joint shape stability on bbox crop (camera-motion invariant)
+   - `both`: run both simultaneously for comparison testing
+6. **Gate** — confirmed (≥25 frames) AND Metric 1 OK AND Metric 2 OK → MANNEQUIN
+
+### Key design decisions
+- **Single class (`mannequin` only)**: two-class model had cls_loss 3.1 at epoch 40 — mannequin and human look too similar for joint classification
+- **No background optical flow for ego-motion**: beach sand is textureless, LK flow fails. Replaced with VSLAM pose
+- **Metrics measure world-frame motion, not pixel motion**: pixel residuals are physically meaningless (1px at 0.5m ≠ 1px at 3m). World centroid std in metres is meaningful
+- **Pose metric camera-invariant by design**: relative joint positions cancel camera motion without needing any warp
+- **ByteTrack over DeepSORT**: DeepSORT ReID embeddings trained on humans confuse mannequins. ByteTrack uses IoU + Kalman only
+
+### VSLAM fallback
+When Isaac ROS VSLAM loses tracking: EIS disabled, Metric 1 suspended, Metric 2 continues using D435i IMU gyro integration for ego-compensation
+
+### Published topics
+| Topic | Type | Content |
+|-------|------|---------|
+| `/drouga/mannequin_detected` | Bool | True when mannequin confirmed |
+| `/drouga/mannequin_pixel` | Point | Pixel centre in raw frame |
+| `/drouga/mannequin_confidence` | Float32 | YOLO score |
+| `/drouga/mannequin_track_id` | Int32 | ByteTrack ID (-1 when none) |
+| `/drouga/mannequin_position_3d` | PointStamped | World-frame 3D position (metres) |
+| `/drouga/annotated_image` | Image | Debug view with boxes |
 
 ## Mission State Machine
 TAKEOFF → NAVIGATE_TO_ZONE → SEARCH_TARGET →
@@ -63,28 +86,34 @@ RELEASE_PAYLOAD → RETURN → LAND_BASE
 
 ---
 
-## Current Development Status (2026-04-15)
+## Current Development Status (2026-04-25)
 
 ### What is done
 - ✅ YOLOv8m trained on Colab (mAP50=0.958, Recall=0.911) → `best.pt`
-- ✅ Offline detection + tracking script (`scripts/track_video.py`) — ByteTrack + ego-motion
-- ✅ Live camera detection script (`scripts/live_detect.py`) — Mac webcam, tested working
-- ✅ Jetson live detection script (`scripts/live_detect_jetson.py`) — RealSense D435, no IMU
-- ✅ ROS2 detection node (`ros2_ws/src/drouga_detection/`) — built, ready to deploy
+- ✅ Offline detection + tracking script (`scripts/track_video.py`)
+- ✅ Live camera scripts: Mac webcam (`scripts/live_detect.py`), Jetson + D435i (`scripts/live_detect_jetson.py`)
+- ✅ Pose-based prototype script (`scripts/live_detect_pose.py`) — laptop only, for threshold tuning
+- ✅ ROS2 detection node with full EIS + VSLAM + two-metric pipeline (`ros2_ws/src/drouga_detection/`)
+- ✅ Depth fusion → 3D world position published on `/drouga/mannequin_position_3d`
+- ✅ EIS (Electronic Image Stabilisation) — adaptive alpha, VSLAM-based, pre-YOLO
+- ✅ Metric 1: world-frame centroid stability via VSLAM + D435i depth
+- ✅ Metric 2: selectable — Farneback flow (`flow`) or pose joint stability (`pose`) or both (`both`)
+- ✅ Interactive launcher `run_detection.sh` — asks flow/pose/both at startup
 - ✅ Full Jetson setup guide (`JETSON_SETUP.md`)
 - ✅ Full ROS2 setup guide (`ROS2_SETUP.md`)
-- ✅ Video stabiliser (`stabiliser/stabilise.py`) → `stabilised.mp4`
+- ✅ Full CV pipeline technical documentation (`CV_PIPELINE.md`)
+- ✅ Remote monitoring from Ubuntu 24.04 laptop via ROS_DOMAIN_ID=42
 
-### What is pending (waiting for hardware)
-- ⬜ Deploy to Jetson and test on real hardware
-- ⬜ TensorRT FP16 export on Jetson → `best.engine`
-- ⬜ Tune CONF, CONFIRM_FRAMES, RESIDUAL_THRESHOLD on real drone footage
-- ⬜ Add RealSense depth fusion → 3D mannequin world position
+### What is pending
+- ⬜ TensorRT FP16 export on Jetson → `best.engine` (required for 28 FPS; PyTorch fallback = ~8 FPS)
+- ⬜ TensorRT export of pose model → `yolov8n-pose.engine`
+- ⬜ Tune parameters on real drone footage: `conf`, `world_stability_threshold`, `bbox_flow_threshold` / `joint_stability_threshold`
+- ⬜ Decide between `flow` and `pose` mode after real-hardware comparison test
 - ⬜ Integrate detection node with mission state machine
-- ⬜ IMU-fused ego-motion (if separate IMU available)
-- ⬜ VIO integration (VINS-Fusion / OpenVINS)
+- ⬜ Visual servoing for precision landing
+- ⬜ ArUco marker for return landing
 - ⬜ Full mission state machine
-- ⬜ TensorRT export + benchmarking
+- ⬜ End-to-end flight test
 
 ---
 
@@ -93,120 +122,63 @@ RELEASE_PAYLOAD → RETURN → LAND_BASE
 ### Step 1 — Model Selection ✅ DONE (2026-04-09)
 - **Chosen: YOLOv8m** (upgraded from YOLOv8s — accuracy is priority)
 - Single class: `mannequin` only (dropped human/bystander class)
-- Rationale:
-  - Single class eliminates classification confusion (loss was 3.1 at epoch 40 with 2 classes)
-  - 28 FPS on Jetson Orin Nano (TensorRT FP16) is sufficient for mission
-- Input resolution: 800×800 (larger than default 640 — better for distant mannequins)
-- Pretrained COCO weights (transfer learning)
+- Rationale: single class eliminates classification confusion (loss 3.1 at epoch 40 with 2 classes)
+- 28 FPS on Jetson Orin Nano (TensorRT FP16)
+- Input resolution: 800×800
 
 ### Step 2 & 3 — Dataset ✅ DONE (2026-04-09)
-- Source: Roboflow ("My First Project") — single class mannequin dataset
-- Cleaned: 538 empty label files removed
-- Final split (RANDOM_SEED=42):
+- Source: Roboflow — single class mannequin dataset, 538 empty labels removed
 
-  | Split | Images | Mannequin instances |
-  |-------|--------|-------------------|
-  | train | 1,188  | ~3,549            |
-  | val   | 321    | ~992              |
-  | test  | 170    | ~492              |
-  | **Total** | **1,679** | **~5,033** |
-
-- Format: YOLOv8 (class_id cx cy w h, normalised)
-- Config: `dataset/data.yaml`
+  | Split | Images | Instances |
+  |-------|--------|-----------|
+  | train | 1,188  | ~3,549    |
+  | val   | 321    | ~992      |
+  | test  | 170    | ~492      |
 
 ### Step 4 — Training ✅ DONE (2026-04-09)
-- Script: `scripts/train.py`
-- Model: YOLOv8m, epochs=150, imgsz=800, batch=8, device=mps
-- Optimiser: AdamW, lr0=0.001, cosine LR schedule, warmup_epochs=5
-- Augmentation: hsv_v=0.5, mosaic=1.0, mixup=0.2, copy_paste=0.1, scale=0.6
-- Regularisation: dropout=0.1, label_smoothing=0.05
-- Trained on Google Colab (T4 GPU) — completed full run, single class (mannequin only)
-- Output: `best.pt` (root directory, 22.5MB)
-- NOTE: model metadata says 2 classes but it is effectively single-class mannequin (class 0)
+- YOLOv8m, 150 epochs, imgsz=800, AdamW, Google Colab T4
+- Output: `best.pt` (22.5MB)
 
-### Step 5 — Validate ✅ DONE (2026-04-09)
-- Model: `best.pt` — validated on test set (170 images)
+### Step 5 — Validation ✅ DONE (2026-04-09)
 
-  | Metric | Result | Target |
-  |--------|--------|--------|
-  | mAP50 | **0.958** | >0.80 ✅ |
-  | mAP50-95 | **0.747** | >0.55 ✅ |
-  | Precision | **0.939** | — ✅ |
-  | Recall | **0.911** | >0.85 ✅ |
+  | Metric | Result |
+  |--------|--------|
+  | mAP50  | **0.958** |
+  | mAP50-95 | **0.747** |
+  | Precision | **0.939** |
+  | Recall | **0.911** |
 
 ### Step 6 — Offline Detection + Tracking ✅ DONE (2026-04-15)
-- Script: `scripts/track_video.py`
-- Input: `stabilised.mp4`
-- Tracker: ByteTrack via Ultralytics `model.track()` — tightly integrated with YOLO
-- Ego-motion compensation:
-  - Lucas-Kanade optical flow estimates frame-to-frame homography
-  - RANSAC rejects moving objects, fits to background only
-  - Per-track residual = distance between actual and predicted (camera-motion-only) position
-  - 75th-pct residual over 60-frame window < 8px → stationary in world → MANNEQUIN (green)
-  - High residual → independently moving → HUMAN (orange)
-  - < 25 consecutive frames → UNCONFIRMED (grey)
-- Key parameters:
-  - `CONF = 0.35`
-  - `CONFIRM_FRAMES = 25` (~0.8s at 30fps)
-  - `RESIDUAL_WINDOW = 60` (2 seconds)
-  - `RESIDUAL_THRESHOLD = 8` pixels (75th percentile)
-- Why ByteTrack over DeepSORT: faster, no ReID network needed, tightly integrated with YOLO. DeepSORT was tested and performed worse (ReID embeddings trained on humans cause confusion with mannequins)
+- Script: `scripts/track_video.py`, input: `stabilised.mp4`
+- ByteTrack + Lucas-Kanade ego-motion (pixel residual method — replaced in ROS2 node by VSLAM)
 
 ### Step 7 — Live Detection Scripts ✅ DONE (2026-04-15)
-- `scripts/live_detect.py` — Mac webcam, tested working, uses OpenCV VideoCapture
-- `scripts/live_detect_jetson.py` — Jetson + RealSense D435 (no IMU), same pipeline
-  - IMU lines removed (camera has no IMU)
-  - Uses pyrealsense2 color stream
-  - Supports `--save` and `--pt` flags
+- `scripts/live_detect.py` — Mac webcam
+- `scripts/live_detect_jetson.py` — Jetson + D435i
+- `scripts/live_detect_pose.py` — pose-based prototype (laptop, for threshold tuning)
 
-### Step 8 — ROS2 Detection Node ✅ DONE (2026-04-15)
+### Step 8 — ROS2 Detection Node ✅ DONE (2026-04-15, updated 2026-04-25)
 - Package: `ros2_ws/src/drouga_detection/`
-- Node: `drouga_detection/detection_node.py`
-- Subscribes: `/camera/color/image_raw` (sensor_msgs/Image) from realsense-ros
-- Publishes:
-  - `/drouga/mannequin_detected` (std_msgs/Bool)
-  - `/drouga/mannequin_pixel` (geometry_msgs/Point — pixel centre cx, cy)
-  - `/drouga/mannequin_confidence` (std_msgs/Float32)
-  - `/drouga/mannequin_track_id` (std_msgs/Int32 — -1 when none)
-  - `/drouga/annotated_image` (sensor_msgs/Image — debug view)
-- All key parameters are ROS2 parameters (tunable at runtime without rebuilding)
-- QoS: image topics use BEST_EFFORT, detection results use RELIABLE
-- Setup guide: `ROS2_SETUP.md`
+- Full EIS + VSLAM + depth + Metric 1 + Metric 2 (flow/pose/both)
+- All parameters tunable at launch without rebuilding
+- `run_detection.sh` — interactive launcher
 
-### Step 9 — TensorRT FP16 Export ⬜ TODO (when Jetson available)
-- Must run ON the Jetson: `model.export(format='engine', half=True, imgsz=800, device=0)`
-- Target: ~28 FPS on Orin Nano
-- Output: `best.engine` — used by both `live_detect_jetson.py` and the ROS2 node
+### Step 9 — TensorRT FP16 Export ⬜ TODO
+- Run on Jetson: `YOLO('best.pt').export(format='engine', half=True, imgsz=800, device=0)`
+- Also export pose model: `YOLO('yolov8n-pose.pt').export(format='engine', half=True, imgsz=640, device=0)`
 
-### Step 10 — Real Hardware Testing ⬜ TODO (when hardware arrives)
-Recommended order:
-1. Static test — Jetson on table, camera at mannequin, tune CONF
-2. Hand-held walking test — verify ByteTrack holds IDs, ego-motion behaviour
-3. Drone mount, motors off — check vibration, USB stability
-4. Drone hover test — first real ego-motion test, retune RESIDUAL_THRESHOLD
-5. Full mission test
+### Step 10 — Real Hardware Testing ⬜ TODO
+1. Static test — camera on tripod, tune `conf` and Metric 2 threshold
+2. Hand-held walking test — verify ByteTrack IDs, EIS behaviour
+3. Run in `both` mode to compare flow vs pose scores side-by-side → pick one
+4. Drone mount, motors off — check vibration effect on EIS
+5. Drone hover test — tune `eis_alpha`, `world_stability_threshold`
+6. Full mission test with human bystander
 
-### Step 11 — Depth Fusion ⬜ TODO (when hardware available)
-- Use RealSense D435 depth stream to compute 3D world position of mannequin
-- Publish as `geometry_msgs/PointStamped` on `/drouga/mannequin_position_3d`
-- Required for precision landing approach and 1m safety constraint
-
-### Step 12 — Full Stack Integration ⬜ TODO
-- VIO (VINS-Fusion / OpenVINS)
-- Mission state machine subscribes to `/drouga/mannequin_detected`
+### Step 11 — Full Stack Integration ⬜ TODO
+- Mission state machine subscribes to `/drouga/mannequin_detected` and `/drouga/mannequin_position_3d`
 - Visual servoing for precision landing
 - ArUco marker for return landing
-
----
-
-## Stabiliser
-- Algorithm: Kalman filter (1D per axis: x, y, rotation) + Lucas-Kanade optical flow
-- Cancels: high-frequency motor vibration + low-frequency wind drift
-- Script: `stabiliser/stabilise.py`
-- Parameters: process_noise=1e-3, measurement_noise=0.1, crop=10%, black border fill
-- Input: `ZARA STORE TOUR.mp4` (phone video, 640×360, 30fps, 367s)
-- Output: `stabilised.mp4` — used for offline detection testing
-- NOTE: no pre-stabilisation in the live pipeline — ego-motion compensation handles camera motion instead
 
 ---
 
@@ -214,21 +186,19 @@ Recommended order:
 
 | File | Purpose |
 |------|---------|
-| `best.pt` | Trained YOLOv8m model (22.5MB, Colab T4) |
-| `dataset/data.yaml` | Training config — paths + class names |
-| `dataset/{train,val,test}/` | Images and labels |
-| `scripts/train.py` | Training script (YOLOv8m) |
-| `scripts/visualise_predictions.py` | Test set visualisation — 4×4 grid |
-| `scripts/track_video.py` | Offline video detection + tracking (Mac) |
+| `best.pt` | Trained YOLOv8m model (22.5MB) |
+| `run_detection.sh` | Interactive launcher — asks flow/pose/both at startup |
+| `CV_PIPELINE.md` | Full technical documentation of the CV pipeline |
+| `JETSON_SETUP.md` | Jetson Orin Nano hardware setup guide |
+| `ROS2_SETUP.md` | ROS2 node build and run guide |
+| `dataset/data.yaml` | Training config |
+| `scripts/train.py` | Training script |
+| `scripts/track_video.py` | Offline video detection + tracking |
 | `scripts/live_detect.py` | Live detection — Mac webcam |
-| `scripts/live_detect_jetson.py` | Live detection — Jetson + RealSense D435 |
-| `ros2_ws/src/drouga_detection/` | ROS2 detection package |
-| `ros2_ws/src/drouga_detection/drouga_detection/detection_node.py` | ROS2 node source |
-| `stabiliser/stabilise.py` | Video stabilisation script |
-| `stabilised.mp4` | Stabilised test video for offline detection |
-| `runs/drouga_mannequin_v1/weights/best.pt` | Copy of trained model in runs folder |
-| `JETSON_SETUP.md` | Full Jetson Orin Nano hardware setup guide |
-| `ROS2_SETUP.md` | Full ROS2 node build and run guide |
+| `scripts/live_detect_jetson.py` | Live detection — Jetson + D435i |
+| `scripts/live_detect_pose.py` | Pose prototype — laptop threshold tuning |
+| `ros2_ws/src/drouga_detection/drouga_detection/detection_node.py` | Main ROS2 node |
+| `stabiliser/stabilise.py` | Video stabilisation (used for early offline testing only) |
 
 ---
 
@@ -236,9 +206,11 @@ Recommended order:
 
 | Issue | Decision |
 |---|---|
-| Two-class model (human + mannequin) had cls_loss 3.1 | Dropped to single class — mannequin only |
-| Model metadata says {0: human, 1: mannequin} | Model actually outputs class 0 = mannequin (single-class training). Metadata is wrong |
-| DeepSORT worse than ByteTrack | DeepSORT ReID embeddings trained on humans — confuses mannequins. ByteTrack is better |
-| Pixel-space stillness filter failed | Drone moves so mannequins move in frame. Replaced with ego-motion compensation |
-| RealSense D435 has no IMU | Optical flow used for ego-motion instead. Separate IMU may come later |
-| Optical flow slow (~15ms) on featureless surfaces (sand) | Risk noted — will need tuning on real beach footage |
+| Two-class model had cls_loss 3.1 | Dropped to single class — mannequin only |
+| Model metadata says `{0: human, 1: mannequin}` | Model outputs class 0 = mannequin. Metadata is wrong, ignore it |
+| DeepSORT worse than ByteTrack | DeepSORT ReID embeddings trained on humans confuse mannequins. Using ByteTrack |
+| Pixel residual ego-motion fails on featureless beach sand | Replaced with VSLAM world-frame centroid stability (Metric 1) |
+| D435 had no IMU | Upgraded to D435**i** (built-in IMU). IMU used as VSLAM fallback for Metric 2 ego-warp |
+| Farneback flow noisy on windy outdoor textures | Pose-based Metric 2 available as alternative — camera-motion invariant, no ego-warp needed |
+| Standing-still human indistinguishable from mannequin | Accepted limitation of all CV approaches. Safety guaranteed by 1m hard stop in state machine |
+| EIS fights intentional navigation turns | Adaptive alpha: jumps to 0.6 when inter-frame rotation > 5° so EIS follows the turn |
